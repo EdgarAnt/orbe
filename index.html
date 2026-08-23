@@ -1,0 +1,268 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>Orbe RA</title>
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: #000;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    }
+    canvas { display: block; }
+
+    #overlay {
+      position: fixed;
+      inset: 0;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 1.25rem;
+      color: #eaf6ff;
+      background: radial-gradient(ellipse at center, #0b1622 0%, #000 75%);
+      text-align: center;
+      padding: 2rem;
+      box-sizing: border-box;
+      z-index: 10;
+    }
+    #overlay h1 {
+      margin: 0;
+      font-size: 1.5rem;
+      font-weight: 600;
+      letter-spacing: 0.02em;
+    }
+    #overlay p {
+      margin: 0;
+      max-width: 28rem;
+      font-size: 0.95rem;
+      line-height: 1.4;
+      color: #9db3c4;
+    }
+    #enter-ar {
+      appearance: none;
+      border: none;
+      border-radius: 999px;
+      padding: 0.85rem 2.2rem;
+      font-size: 1.05rem;
+      font-weight: 600;
+      color: #04121c;
+      background: linear-gradient(135deg, #7fe3ff, #66ccff);
+      cursor: pointer;
+      box-shadow: 0 0 24px rgba(102, 204, 255, 0.45);
+    }
+    #enter-ar:active { transform: scale(0.97); }
+    #enter-ar[disabled] {
+      opacity: 0.4;
+      cursor: not-allowed;
+      box-shadow: none;
+    }
+    #xr-status {
+      font-size: 0.85rem;
+      color: #ff8a8a;
+      max-width: 24rem;
+      min-height: 1.2em;
+    }
+  </style>
+</head>
+<body>
+
+  <div id="overlay">
+    <h1>Orbe RA</h1>
+    <p>Un orbe que flota sobre tu palma. Poné el visor, tocá el botón y mové la mano.</p>
+    <button id="enter-ar">Entrar en RA</button>
+    <div id="xr-status"></div>
+  </div>
+
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.169.0/build/three.module.js"
+      }
+    }
+  </script>
+
+  <script type="module">
+    import * as THREE from "three";
+
+    // ------------------------------------------------------------------
+    // Constantes de ajuste — todo lo que probablemente quieras tocar
+    // ------------------------------------------------------------------
+    const CONFIG = {
+      HAND_JOINT: "middle-finger-metacarpal", // joint del que cuelga el orbe
+      ORB_OFFSET_Y: 0.10,       // metros por encima del joint
+
+      CORE_RADIUS: 0.02,        // radio del núcleo sólido (m)
+      HALO_SCALE: 2.0,          // halo = CORE_RADIUS * HALO_SCALE
+      HALO_OPACITY: 0.35,
+      CAGE_SCALE: 3.0,          // jaula wireframe = CORE_RADIUS * CAGE_SCALE
+      CAGE_ROTATION_SPEED: 0.6, // rad/seg, eje Y
+      CAGE_ROTATION_SPEED_X: 0.35, // rad/seg, eje X
+
+      COLOR: 0x66ccff,
+
+      SMOOTHING_RATE: 12,       // más alto = el orbe sigue la mano más rápido
+    };
+
+    // ------------------------------------------------------------------
+    // Escena base
+    // ------------------------------------------------------------------
+    const scene = new THREE.Scene();
+
+    const camera = new THREE.PerspectiveCamera(
+      70,
+      window.innerWidth / window.innerHeight,
+      0.01,
+      20
+    );
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+    renderer.setPixelRatio(window.devicePixelRatio);
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setClearColor(0x000000, 0); // transparente: se ve el passthrough detrás
+    renderer.xr.enabled = true;
+    renderer.xr.setReferenceSpaceType("local-floor");
+    document.body.appendChild(renderer.domElement);
+
+    window.addEventListener("resize", () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+
+    // ------------------------------------------------------------------
+    // Orbe: núcleo + halo aditivo + jaula wireframe. Sin luces.
+    // ------------------------------------------------------------------
+    function createOrb() {
+      const group = new THREE.Group();
+
+      const core = new THREE.Mesh(
+        new THREE.SphereGeometry(CONFIG.CORE_RADIUS, 24, 16),
+        new THREE.MeshBasicMaterial({ color: CONFIG.COLOR })
+      );
+
+      const halo = new THREE.Mesh(
+        new THREE.SphereGeometry(CONFIG.CORE_RADIUS * CONFIG.HALO_SCALE, 24, 16),
+        new THREE.MeshBasicMaterial({
+          color: CONFIG.COLOR,
+          transparent: true,
+          opacity: CONFIG.HALO_OPACITY,
+          blending: THREE.AdditiveBlending,
+          depthWrite: false,
+        })
+      );
+
+      const cage = new THREE.Mesh(
+        new THREE.IcosahedronGeometry(CONFIG.CORE_RADIUS * CONFIG.CAGE_SCALE, 0),
+        new THREE.MeshBasicMaterial({
+          color: CONFIG.COLOR,
+          wireframe: true,
+          transparent: true,
+          opacity: 0.6,
+          depthWrite: false,
+        })
+      );
+
+      group.add(core, halo, cage);
+      group.userData.cage = cage;
+      group.visible = false; // recién se muestra cuando la mano está trackeada
+      return group;
+    }
+
+    // ------------------------------------------------------------------
+    // Manos y orbes — un par por mano (0 = izquierda o derecha según el
+    // sistema, no lo asumimos; simplemente indexamos 0 y 1)
+    // ------------------------------------------------------------------
+    const hands = [renderer.xr.getHand(0), renderer.xr.getHand(1)];
+    const orbs = [createOrb(), createOrb()];
+
+    for (let i = 0; i < 2; i++) {
+      scene.add(hands[i]);
+      scene.add(orbs[i]);
+    }
+
+    // ------------------------------------------------------------------
+    // Loop de render — sin asignaciones de memoria por frame
+    // ------------------------------------------------------------------
+    const clock = new THREE.Clock();
+    const _jointPos = new THREE.Vector3();
+
+    function render() {
+      const dt = clock.getDelta();
+      const lerpAlpha = 1 - Math.exp(-CONFIG.SMOOTHING_RATE * dt);
+
+      for (let i = 0; i < 2; i++) {
+        const joint = hands[i].joints[CONFIG.HAND_JOINT];
+        const orb = orbs[i];
+
+        if (joint && joint.visible) {
+          joint.getWorldPosition(_jointPos);
+          _jointPos.y += CONFIG.ORB_OFFSET_Y;
+          orb.position.lerp(_jointPos, lerpAlpha);
+          orb.visible = true;
+        } else {
+          orb.visible = false;
+        }
+
+        const cage = orb.userData.cage;
+        cage.rotation.y += CONFIG.CAGE_ROTATION_SPEED * dt;
+        cage.rotation.x += CONFIG.CAGE_ROTATION_SPEED_X * dt;
+      }
+
+      renderer.render(scene, camera);
+    }
+    renderer.setAnimationLoop(render);
+
+    // ------------------------------------------------------------------
+    // UI: entrada / salida de sesión y manejo de "no soportado"
+    // ------------------------------------------------------------------
+    const overlay = document.getElementById("overlay");
+    const enterButton = document.getElementById("enter-ar");
+    const statusEl = document.getElementById("xr-status");
+
+    function showUnsupported(message) {
+      statusEl.textContent = message;
+      enterButton.disabled = true;
+    }
+
+    if (!navigator.xr) {
+      showUnsupported(
+        "WebXR no está disponible en este navegador. Abrí esta página en el navegador del Meta Quest."
+      );
+    } else {
+      navigator.xr.isSessionSupported("immersive-ar").then((supported) => {
+        if (!supported) {
+          showUnsupported("Este dispositivo no soporta realidad aumentada (immersive-ar).");
+        }
+      });
+    }
+
+    async function enterAR() {
+      statusEl.textContent = "";
+      try {
+        const session = await navigator.xr.requestSession("immersive-ar", {
+          optionalFeatures: ["hand-tracking", "local-floor"],
+        });
+
+        renderer.xr.addEventListener("sessionend", onSessionEnd, { once: true });
+
+        await renderer.xr.setSession(session);
+        overlay.style.display = "none";
+      } catch (err) {
+        showUnsupported("No se pudo iniciar la sesión de RA: " + err.message);
+      }
+    }
+
+    function onSessionEnd() {
+      overlay.style.display = "flex";
+    }
+
+    enterButton.addEventListener("click", enterAR);
+  </script>
+</body>
+</html>
