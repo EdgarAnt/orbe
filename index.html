@@ -155,6 +155,32 @@
     });
 
     // ------------------------------------------------------------------
+    // Textura circular para los píxeles del plasma (si no se le pasa un
+    // mapa a PointsMaterial, three.js dibuja cuadrados). Se genera una
+    // sola vez con canvas — sin depender de ningún archivo externo.
+    // ------------------------------------------------------------------
+    function createCircleTexture() {
+      const size = 64;
+      const canvas = document.createElement("canvas");
+      canvas.width = canvas.height = size;
+      const ctx = canvas.getContext("2d");
+
+      const gradient = ctx.createRadialGradient(
+        size / 2, size / 2, 0,
+        size / 2, size / 2, size / 2
+      );
+      gradient.addColorStop(0, "rgba(255,255,255,1)");
+      gradient.addColorStop(0.7, "rgba(255,255,255,1)");
+      gradient.addColorStop(1, "rgba(255,255,255,0)");
+
+      ctx.fillStyle = gradient;
+      ctx.fillRect(0, 0, size, size);
+
+      return new THREE.CanvasTexture(canvas);
+    }
+    const PIXEL_TEXTURE = createCircleTexture();
+
+    // ------------------------------------------------------------------
     // Distribución pareja de puntos sobre una esfera (esfera de Fibonacci),
     // con un poco de jitter radial para que la cáscara de píxeles no se
     // vea perfectamente geométrica.
@@ -236,6 +262,7 @@
       const plasma = new THREE.Points(
         plasmaGeometry,
         new THREE.PointsMaterial({
+          map: PIXEL_TEXTURE,
           size: CONFIG.PLASMA_PIXEL_SIZE,
           sizeAttenuation: true,
           vertexColors: true,
