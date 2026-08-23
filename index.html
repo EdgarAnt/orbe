@@ -126,6 +126,10 @@
       // Agarrar / soltar con pellizco (pulgar + índice) de la mano derecha
       PINCH_DISTANCE: 0.025, // distancia (m) pulgar-índice para contar como pellizco
       GRAB_RADIUS: 0.06,     // distancia (m) máxima entre el pellizco y el orbe para poder agarrarlo
+
+      // Oclusión: qué tan "gorda" es la mano invisible que tapa al orbe
+      // cuando pasa por delante (1 = grosor real estimado del hueso)
+      OCCLUDER_RADIUS_SCALE: 1.35,
     };
 
     // ------------------------------------------------------------------
@@ -302,6 +306,49 @@
     }
 
     // ------------------------------------------------------------------
+    // Oclusión de manos: una esfera invisible (solo escribe profundidad,
+    // no color) pegada a cada joint de la mano. Cuando la mano real pasa
+    // delante del orbe, esta malla "gana" la prueba de profundidad y
+    // tapa esa parte del orbe, dejando ver el passthrough (la mano real)
+    // debajo — sin esto el orbe se dibuja siempre encima de todo.
+    // ------------------------------------------------------------------
+    const OCCLUDER_JOINT_NAMES = [
+      "wrist",
+      "thumb-metacarpal", "thumb-phalanx-proximal", "thumb-phalanx-distal", "thumb-tip",
+      "index-finger-metacarpal", "index-finger-phalanx-proximal", "index-finger-phalanx-intermediate", "index-finger-phalanx-distal", "index-finger-tip",
+      "middle-finger-metacarpal", "middle-finger-phalanx-proximal", "middle-finger-phalanx-intermediate", "middle-finger-phalanx-distal", "middle-finger-tip",
+      "ring-finger-metacarpal", "ring-finger-phalanx-proximal", "ring-finger-phalanx-intermediate", "ring-finger-phalanx-distal", "ring-finger-tip",
+      "pinky-finger-metacarpal", "pinky-finger-phalanx-proximal", "pinky-finger-phalanx-intermediate", "pinky-finger-phalanx-distal", "pinky-finger-tip",
+    ];
+
+    function baseRadiusForJoint(name) {
+      if (name === "wrist") return 0.022;
+      if (name.endsWith("tip")) return 0.007;
+      if (name.endsWith("metacarpal")) return 0.013;
+      if (name.endsWith("proximal")) return 0.010;
+      if (name.endsWith("intermediate")) return 0.008;
+      return 0.0075; // distal
+    }
+
+    const OCCLUDER_GEOMETRY = new THREE.SphereGeometry(1, 8, 6); // radio 1: se escala por joint
+    const OCCLUDER_MATERIAL = new THREE.MeshBasicMaterial({ colorWrite: false });
+
+    function addHandOccluder(hand) {
+      if (hand.userData.occluded) return; // evita duplicar si "connected" vuelve a disparar
+      hand.userData.occluded = true;
+
+      for (const jointName of OCCLUDER_JOINT_NAMES) {
+        const joint = hand.joints[jointName];
+        if (!joint) continue;
+
+        const radius = baseRadiusForJoint(jointName) * CONFIG.OCCLUDER_RADIUS_SCALE;
+        const sphere = new THREE.Mesh(OCCLUDER_GEOMETRY, OCCLUDER_MATERIAL);
+        sphere.scale.setScalar(radius);
+        joint.add(sphere); // hijo del joint: hereda su posición y su visibilidad
+      }
+    }
+
+    // ------------------------------------------------------------------
     // Manos — se agregan las dos (three.js necesita esto para actualizar
     // los joints), pero solo usamos la que resulte ser la derecha, según
     // el evento "connected" de WebXR (el índice 0/1 no garantiza mano).
@@ -313,6 +360,7 @@
       scene.add(hand);
       hand.addEventListener("connected", (event) => {
         if (event.data.handedness === "right") rightHand = hand;
+        addHandOccluder(hand);
       });
       hand.addEventListener("disconnected", () => {
         if (rightHand === hand) rightHand = null;
