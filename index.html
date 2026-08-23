@@ -321,6 +321,12 @@
       "pinky-finger-metacarpal", "pinky-finger-phalanx-proximal", "pinky-finger-phalanx-intermediate", "pinky-finger-phalanx-distal", "pinky-finger-tip",
     ];
 
+    // El pulgar y el índice son los dedos del pellizco: si también tapan
+    // al orbe, justo al acercarte para agarrarlo dejás de verlo y no
+    // podés apuntar. Se excluyen de la oclusión; el resto de la mano
+    // sigue tapando con normalidad.
+    const OCCLUDER_EXCLUDED_JOINTS = new Set(["thumb-tip", "index-finger-tip"]);
+
     function baseRadiusForJoint(name) {
       if (name === "wrist") return 0.022;
       if (name.endsWith("tip")) return 0.007;
@@ -338,6 +344,7 @@
       hand.userData.occluded = true;
 
       for (const jointName of OCCLUDER_JOINT_NAMES) {
+        if (OCCLUDER_EXCLUDED_JOINTS.has(jointName)) continue;
         const joint = hand.joints[jointName];
         if (!joint) continue;
 
