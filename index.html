@@ -74,7 +74,7 @@
 
   <div id="overlay">
     <h1>Orbe RA</h1>
-    <p>Un orbe flota frente a vos. Pellizcalo con el pulgar y el índice de la mano derecha para agarrarlo, volvé a pellizcar para soltarlo, y cerrá el puño mientras lo tenés agarrado para romperlo y escanear el cuarto.</p>
+    <p>Un orbe flota frente a vos. Pellizcalo con el pulgar y el índice de la mano derecha para agarrarlo, volvé a pellizcar para soltarlo, y cerrá el puño mientras lo tenés agarrado para romperlo, escanear el cuarto y guardar una maqueta chica adentro.</p>
     <button id="enter-ar">Entrar en RA</button>
     <div id="xr-status"></div>
   </div>
@@ -145,10 +145,14 @@
       SCAN_SWEEP_DURATION: 2.2,    // segundos del barrido de piso a techo
       SCAN_SURFACE_FADE_IN: 0.35,  // segundos en que una superficie aparece al ser "tocada"
       SCAN_LINGER: 2.0,            // segundos que queda todo visible tras el barrido
-      SCAN_FADE_OUT: 1.0,          // segundos en que se apaga todo al final
       SCAN_ROOM_HEIGHT: 2.5,       // alto asumido (m) si no hay geometría detectada
       SCAN_FILL_OPACITY: 0.16,     // opacidad de la superficie rellena de cada plano
       SCAN_WIRE_OPACITY: 0.75,     // opacidad de las líneas de wireframe
+
+      // Maqueta: el cuarto escaneado se encoge hacia el orbe y queda
+      // adentro, como una miniatura permanente
+      MAQUETTE_SCALE: 0.06,             // tamaño final = tamaño real × esto
+      MAQUETTE_COLLAPSE_DURATION: 1.2,  // segundos que tarda el zoom a miniatura
     };
 
     // ------------------------------------------------------------------
@@ -493,6 +497,7 @@
       orbState = ORB_STATE.SHATTERING;
       orb.userData.shatterElapsed = 0;
       _floatAnchor.copy(orb.position); // el orbe reaparecerá acá cuando termine todo
+      clearMaqueta(); // si ya tenía una maqueta adentro, se pierde con esta ruptura
 
       const plasma = orb.userData.plasma;
       const positions = plasma.points.geometry.attributes.position.array;
@@ -545,13 +550,14 @@
     // láser de piso a techo, con la superficie encendiéndose a su paso.
     // ------------------------------------------------------------------
     const scanState = {
-      phase: "sweep", // "sweep" -> "linger" -> "fadeout"
+      phase: "sweep", // "sweep" -> "linger" -> "collapse"
       elapsed: 0,
       minY: 0,
       maxY: CONFIG.SCAN_ROOM_HEIGHT,
       surfaces: [],
       sweepMesh: null,
     };
+    const _collapseTmp = new THREE.Vector3();
 
     function createSweepMesh() {
       const geometry = new THREE.RingGeometry(0.02, 3, 48);
@@ -604,6 +610,8 @@
         revealY: group.position.y,
         revealed: false,
         revealElapsed: 0,
+        originalPosition: group.position.clone(),
+        originalScale: group.scale.clone(),
       };
     }
 
@@ -633,6 +641,8 @@
         revealY: wireMesh.position.y,
         revealed: false,
         revealElapsed: 0,
+        originalPosition: wireMesh.position.clone(),
+        originalScale: wireMesh.scale.clone(),
       };
     }
 
@@ -723,32 +733,62 @@
         }
       } else if (scanState.phase === "linger") {
         if (scanState.elapsed >= CONFIG.SCAN_LINGER) {
-          scanState.phase = "fadeout";
+          scanState.phase = "collapse";
           scanState.elapsed = 0;
         }
-      } else if (scanState.phase === "fadeout") {
-        const t = Math.min(scanState.elapsed / CONFIG.SCAN_FADE_OUT, 1);
-        const fade = 1 - t;
-        scanState.sweepMesh.material.opacity = 0.5 * fade;
+      } else if (scanState.phase === "collapse") {
+        // el cuarto entero se encoge hacia _floatAnchor (zoom a miniatura)
+        // en vez de desvanecerse: termina como una maqueta chica del cuarto
+        const t = Math.min(scanState.elapsed / CONFIG.MAQUETTE_COLLAPSE_DURATION, 1);
+        const scaleFactor = THREE.MathUtils.lerp(1, CONFIG.MAQUETTE_SCALE, t);
+
         for (const surface of scanState.surfaces) {
-          for (let i = 0; i < surface.materials.length; i++) {
-            surface.materials[i].opacity = surface.baseOpacities[i] * fade;
-          }
+          _collapseTmp
+            .copy(surface.originalPosition)
+            .sub(_floatAnchor)
+            .multiplyScalar(scaleFactor)
+            .add(_floatAnchor);
+          surface.object3d.position.copy(_collapseTmp);
+          surface.object3d.scale.copy(surface.originalScale).multiplyScalar(scaleFactor);
         }
-        if (t >= 1) endRoomScan();
+
+        scanState.sweepMesh.material.opacity = 0.5 * (1 - t);
+
+        if (t >= 1) finishMaquette();
       }
     }
 
-    function endRoomScan() {
-      scanState.surfaces.forEach(disposeSurface);
-      scanState.surfaces.length = 0;
+    // La maqueta (superficies ya encogidas) pasa a ser hija permanente del
+    // orbe — "se mete adentro" y viaja con él de ahí en más.
+    function finishMaquette() {
       scene.remove(scanState.sweepMesh);
+
+      clearMaqueta(); // por si ya había una maqueta de un escaneo anterior
+
+      orb.userData.maquetaObjects = scanState.surfaces.map((s) => s.object3d);
+      for (const object3d of orb.userData.maquetaObjects) {
+        orb.attach(object3d); // cambia de padre conservando su transform de mundo
+      }
+      scanState.surfaces.length = 0;
 
       orb.userData.innerGlow.scale.setScalar(1);
       orb.userData.plasma.points.material.opacity = 0.9;
       orb.position.copy(_floatAnchor);
       orb.visible = true;
       orbState = ORB_STATE.FLOATING;
+    }
+
+    function clearMaqueta() {
+      if (!orb.userData.maquetaObjects) return;
+      for (const object3d of orb.userData.maquetaObjects) {
+        orb.remove(object3d);
+        object3d.traverse((child) => {
+          if (!child.isMesh) return;
+          child.geometry.dispose();
+          child.material.dispose();
+        });
+      }
+      orb.userData.maquetaObjects = null;
     }
 
     // Estados FLOATING / HELD: pellizco para agarrar/soltar, puño para
