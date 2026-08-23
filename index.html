@@ -74,7 +74,7 @@
 
   <div id="overlay">
     <h1>Orbe RA</h1>
-    <p>Un orbe que flota sobre tu palma. Poné el visor, tocá el botón y mové la mano.</p>
+    <p>Un orbe flota frente a vos. Pellizcalo con el pulgar y el índice de la mano derecha para agarrarlo, y volvé a pellizcar para soltarlo.</p>
     <button id="enter-ar">Entrar en RA</button>
     <div id="xr-status"></div>
   </div>
@@ -113,7 +113,19 @@
       PLASMA_COLOR_A: 0x66ccff,    // color en un polo de la esfera
       PLASMA_COLOR_B: 0xff4fd8,    // color en el polo opuesto — degradé estilo plasma
 
-      SMOOTHING_RATE: 12,       // más alto = el orbe sigue la mano más rápido
+      SMOOTHING_RATE: 12,       // más alto = el orbe sigue el objetivo más rápido
+
+      // Dónde flota el orbe cuando no está agarrado (espacio local-floor:
+      // Y = altura desde el piso, Z negativo = adelante de donde arrancó la sesión)
+      FLOAT_ANCHOR_X: 0,
+      FLOAT_ANCHOR_Y: 1.3,
+      FLOAT_ANCHOR_Z: -0.45,
+      FLOAT_BOB_AMPLITUDE: 0.025, // metros que sube y baja mientras flota
+      FLOAT_BOB_SPEED: 1.2,       // rad/seg del vaivén
+
+      // Agarrar / soltar con pellizco (pulgar + índice) de la mano derecha
+      PINCH_DISTANCE: 0.025, // distancia (m) pulgar-índice para contar como pellizco
+      GRAB_RADIUS: 0.06,     // distancia (m) máxima entre el pellizco y el orbe para poder agarrarlo
     };
 
     // ------------------------------------------------------------------
@@ -236,7 +248,6 @@
 
       group.add(core, halo, plasma);
       group.userData.plasma = { points: plasma, basePositions, phases, speeds };
-      group.visible = false; // recién se muestra cuando la mano está trackeada
       return group;
     }
 
@@ -264,44 +275,100 @@
     }
 
     // ------------------------------------------------------------------
-    // Manos y orbes — un par por mano (0 = izquierda o derecha según el
-    // sistema, no lo asumimos; simplemente indexamos 0 y 1)
+    // Manos — se agregan las dos (three.js necesita esto para actualizar
+    // los joints), pero solo usamos la que resulte ser la derecha, según
+    // el evento "connected" de WebXR (el índice 0/1 no garantiza mano).
     // ------------------------------------------------------------------
-    const hands = [renderer.xr.getHand(0), renderer.xr.getHand(1)];
-    const orbs = [createOrb(), createOrb()];
+    const handCandidates = [renderer.xr.getHand(0), renderer.xr.getHand(1)];
+    let rightHand = null;
 
-    for (let i = 0; i < 2; i++) {
-      scene.add(hands[i]);
-      scene.add(orbs[i]);
+    for (const hand of handCandidates) {
+      scene.add(hand);
+      hand.addEventListener("connected", (event) => {
+        if (event.data.handedness === "right") rightHand = hand;
+      });
+      hand.addEventListener("disconnected", () => {
+        if (rightHand === hand) rightHand = null;
+      });
     }
+
+    // Un solo orbe. Arranca flotando en su posición de reposo (sin lerp
+    // inicial desde el origen, para que no "vuele" al entrar en RA).
+    const orb = createOrb();
+    scene.add(orb);
+
+    const ORB_STATE = { FLOATING: "floating", HELD: "held" };
+    let orbState = ORB_STATE.FLOATING;
+    let wasPinching = false;
 
     // ------------------------------------------------------------------
     // Loop de render — sin asignaciones de memoria por frame
     // ------------------------------------------------------------------
     const clock = new THREE.Clock();
     const _jointPos = new THREE.Vector3();
+    const _thumbPos = new THREE.Vector3();
+    const _indexPos = new THREE.Vector3();
+    const _pinchMid = new THREE.Vector3();
+    const _floatAnchor = new THREE.Vector3(
+      CONFIG.FLOAT_ANCHOR_X,
+      CONFIG.FLOAT_ANCHOR_Y,
+      CONFIG.FLOAT_ANCHOR_Z
+    );
+    orb.position.copy(_floatAnchor);
+
+    // Pellizco de la mano derecha: distancia pulgar-índice. Deja el
+    // resultado en variables reutilizadas en vez de devolver un objeto.
+    let pinchActive = false;
+    function samplePinch() {
+      if (!rightHand) {
+        pinchActive = false;
+        return;
+      }
+      const thumb = rightHand.joints["thumb-tip"];
+      const index = rightHand.joints["index-finger-tip"];
+      if (!thumb || !index || !thumb.visible || !index.visible) {
+        pinchActive = false;
+        return;
+      }
+      thumb.getWorldPosition(_thumbPos);
+      index.getWorldPosition(_indexPos);
+      _pinchMid.copy(_thumbPos).add(_indexPos).multiplyScalar(0.5);
+      pinchActive = _thumbPos.distanceTo(_indexPos) < CONFIG.PINCH_DISTANCE;
+    }
 
     function render() {
       const dt = clock.getDelta();
       const elapsedTime = clock.getElapsedTime();
       const lerpAlpha = 1 - Math.exp(-CONFIG.SMOOTHING_RATE * dt);
 
-      for (let i = 0; i < 2; i++) {
-        const joint = hands[i].joints[CONFIG.HAND_JOINT];
-        const orb = orbs[i];
+      samplePinch();
+      const pinchStarted = pinchActive && !wasPinching;
+      wasPinching = pinchActive;
 
+      if (orbState === ORB_STATE.FLOATING && pinchStarted) {
+        if (_pinchMid.distanceTo(orb.position) < CONFIG.GRAB_RADIUS) {
+          orbState = ORB_STATE.HELD; // lo agarraste
+        }
+      } else if (orbState === ORB_STATE.HELD && pinchStarted) {
+        orbState = ORB_STATE.FLOATING; // te lo quitaste: queda flotando ahí mismo
+        _floatAnchor.copy(orb.position);
+      }
+
+      if (orbState === ORB_STATE.HELD) {
+        const joint = rightHand && rightHand.joints[CONFIG.HAND_JOINT];
         if (joint && joint.visible) {
           joint.getWorldPosition(_jointPos);
           _jointPos.y += CONFIG.ORB_OFFSET_Y;
           orb.position.lerp(_jointPos, lerpAlpha);
-          orb.visible = true;
-        } else {
-          orb.visible = false;
         }
-
-        updatePlasma(orb.userData.plasma, elapsedTime);
+        // si se pierde el tracking de la mano, el orbe se queda quieto
+      } else {
+        _jointPos.copy(_floatAnchor);
+        _jointPos.y += Math.sin(elapsedTime * CONFIG.FLOAT_BOB_SPEED) * CONFIG.FLOAT_BOB_AMPLITUDE;
+        orb.position.lerp(_jointPos, lerpAlpha);
       }
 
+      updatePlasma(orb.userData.plasma, elapsedTime);
       renderer.render(scene, camera);
     }
     renderer.setAnimationLoop(render);
