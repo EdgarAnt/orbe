@@ -74,7 +74,7 @@
 
   <div id="overlay">
     <h1>Orbe RA</h1>
-    <p>Un orbe flota frente a vos. Pellizcalo con el pulgar y el índice de la mano derecha para agarrarlo, y volvé a pellizcar para soltarlo.</p>
+    <p>Un orbe flota frente a vos. Pellizcalo con el pulgar y el índice de la mano derecha para agarrarlo, volvé a pellizcar para soltarlo, y cerrá el puño mientras lo tenés agarrado para romperlo y escanear el cuarto.</p>
     <button id="enter-ar">Entrar en RA</button>
     <div id="xr-status"></div>
   </div>
@@ -130,6 +130,25 @@
       // Oclusión: qué tan "gorda" es la mano invisible que tapa al orbe
       // cuando pasa por delante (1 = grosor real estimado del hueso)
       OCCLUDER_RADIUS_SCALE: 1.35,
+
+      // Puño cerrado (los 4 dedos, sin el pulgar) mientras tenés el orbe
+      // agarrado: rompe el orbe y arranca el escaneo del cuarto
+      FIST_TIP_TO_WRIST_THRESHOLD: 0.09, // debajo de esto (m) se considera puño cerrado
+
+      // Ruptura del orbe: sus propios píxeles salen disparados y se apagan
+      SHATTER_DURATION: 0.7,   // segundos hasta que termina de dispersarse
+      SHATTER_SPEED: 0.9,      // m/seg, velocidad inicial de cada píxel
+      SHATTER_GRAVITY: 0.6,    // m/seg², cae mientras se dispersa
+
+      // Escaneo del cuarto (plane-detection + mesh-detection de WebXR)
+      SCAN_COLOR: 0x33ffcc,        // color del láser y de las superficies reveladas
+      SCAN_SWEEP_DURATION: 2.2,    // segundos del barrido de piso a techo
+      SCAN_SURFACE_FADE_IN: 0.35,  // segundos en que una superficie aparece al ser "tocada"
+      SCAN_LINGER: 2.0,            // segundos que queda todo visible tras el barrido
+      SCAN_FADE_OUT: 1.0,          // segundos en que se apaga todo al final
+      SCAN_ROOM_HEIGHT: 2.5,       // alto asumido (m) si no hay geometría detectada
+      SCAN_FILL_OPACITY: 0.16,     // opacidad de la superficie rellena de cada plano
+      SCAN_WIRE_OPACITY: 0.75,     // opacidad de las líneas de wireframe
     };
 
     // ------------------------------------------------------------------
@@ -229,6 +248,10 @@
         })
       );
 
+      // Agrupados para poder "implosionarlos" (escala a 0) juntos al romperse
+      const innerGlow = new THREE.Group();
+      innerGlow.add(core, halo);
+
       // Cáscara de píxeles: cada uno "hierve" hacia adentro/afuera de su
       // propio radio de reposo. basePositions guarda ese radio de reposo;
       // el atributo `position` del BufferGeometry se reescribe cada frame.
@@ -277,8 +300,15 @@
         })
       );
 
-      group.add(core, halo, plasma);
-      group.userData.plasma = { points: plasma, basePositions, phases, speeds };
+      group.add(innerGlow, plasma);
+      group.userData.innerGlow = innerGlow;
+      group.userData.plasma = {
+        points: plasma,
+        basePositions,
+        phases,
+        speeds,
+        velocities: new Float32Array(CONFIG.PLASMA_COUNT * 3), // se llena al romperse
+      };
       return group;
     }
 
@@ -379,9 +409,15 @@
     const orb = createOrb();
     scene.add(orb);
 
-    const ORB_STATE = { FLOATING: "floating", HELD: "held" };
+    const ORB_STATE = {
+      FLOATING: "floating",
+      HELD: "held",
+      SHATTERING: "shattering", // se rompe en sus píxeles al cerrar el puño
+      SCANNING: "scanning",     // barrido láser del cuarto en curso
+    };
     let orbState = ORB_STATE.FLOATING;
     let wasPinching = false;
+    let wasFisting = false;
 
     // ------------------------------------------------------------------
     // Loop de render — sin asignaciones de memoria por frame
@@ -418,22 +454,327 @@
       pinchActive = _thumbPos.distanceTo(_indexPos) < CONFIG.PINCH_DISTANCE;
     }
 
-    function render() {
-      const dt = clock.getDelta();
-      const elapsedTime = clock.getElapsedTime();
+    // Puño cerrado: promedio de distancia muñeca→punta de los 4 dedos
+    // (sin el pulgar). Mano abierta = dedos lejos de la muñeca; puño
+    // cerrado = dedos curvados cerca de la muñeca.
+    const FIST_FINGER_TIPS = [
+      "index-finger-tip", "middle-finger-tip", "ring-finger-tip", "pinky-finger-tip",
+    ];
+    const _wristPos = new THREE.Vector3();
+    const _tipPos = new THREE.Vector3();
+    let fistActive = false;
+    function sampleFist() {
+      const wrist = rightHand && rightHand.joints["wrist"];
+      if (!wrist || !wrist.visible) {
+        fistActive = false;
+        return;
+      }
+      wrist.getWorldPosition(_wristPos);
+
+      let total = 0;
+      for (const name of FIST_FINGER_TIPS) {
+        const tip = rightHand.joints[name];
+        if (!tip || !tip.visible) {
+          fistActive = false;
+          return;
+        }
+        tip.getWorldPosition(_tipPos);
+        total += _tipPos.distanceTo(_wristPos);
+      }
+      fistActive = total / FIST_FINGER_TIPS.length < CONFIG.FIST_TIP_TO_WRIST_THRESHOLD;
+    }
+
+    // ------------------------------------------------------------------
+    // Ruptura del orbe: sus propios píxeles salen disparados hacia afuera
+    // (con algo de azar y gravedad) y todo se desvanece; al terminar
+    // arranca el escaneo del cuarto.
+    // ------------------------------------------------------------------
+    function startShatter() {
+      orbState = ORB_STATE.SHATTERING;
+      orb.userData.shatterElapsed = 0;
+      _floatAnchor.copy(orb.position); // el orbe reaparecerá acá cuando termine todo
+
+      const plasma = orb.userData.plasma;
+      const positions = plasma.points.geometry.attributes.position.array;
+      const velocities = plasma.velocities;
+
+      for (let i = 0; i < CONFIG.PLASMA_COUNT; i++) {
+        const px = positions[i * 3 + 0];
+        const py = positions[i * 3 + 1];
+        const pz = positions[i * 3 + 2];
+        const len = Math.hypot(px, py, pz) || 1;
+        const speed = CONFIG.SHATTER_SPEED * (0.6 + Math.random() * 0.8);
+
+        velocities[i * 3 + 0] = (px / len) * speed + (Math.random() - 0.5) * speed * 0.4;
+        velocities[i * 3 + 1] = (py / len) * speed + (Math.random() - 0.5) * speed * 0.4;
+        velocities[i * 3 + 2] = (pz / len) * speed + (Math.random() - 0.5) * speed * 0.4;
+      }
+
+      plasma.points.material.opacity = 0.9;
+      orb.userData.innerGlow.scale.setScalar(1);
+    }
+
+    function updateShatter(dt, frame) {
+      const plasma = orb.userData.plasma;
+      const positions = plasma.points.geometry.attributes.position.array;
+      const velocities = plasma.velocities;
+
+      orb.userData.shatterElapsed += dt;
+      const t = Math.min(orb.userData.shatterElapsed / CONFIG.SHATTER_DURATION, 1);
+
+      for (let i = 0; i < CONFIG.PLASMA_COUNT; i++) {
+        velocities[i * 3 + 1] -= CONFIG.SHATTER_GRAVITY * dt;
+        positions[i * 3 + 0] += velocities[i * 3 + 0] * dt;
+        positions[i * 3 + 1] += velocities[i * 3 + 1] * dt;
+        positions[i * 3 + 2] += velocities[i * 3 + 2] * dt;
+      }
+      plasma.points.geometry.attributes.position.needsUpdate = true;
+      plasma.points.material.opacity = 0.9 * (1 - t);
+      orb.userData.innerGlow.scale.setScalar(Math.max(0, 1 - t * 1.6));
+
+      if (t >= 1 && frame) {
+        orb.visible = false;
+        orbState = ORB_STATE.SCANNING;
+        startRoomScan(frame);
+      }
+    }
+
+    // ------------------------------------------------------------------
+    // Escaneo del cuarto: lee los planos/mallas que la Quest ya detectó
+    // (plane-detection / mesh-detection) y los revela con un barrido tipo
+    // láser de piso a techo, con la superficie encendiéndose a su paso.
+    // ------------------------------------------------------------------
+    const scanState = {
+      phase: "sweep", // "sweep" -> "linger" -> "fadeout"
+      elapsed: 0,
+      minY: 0,
+      maxY: CONFIG.SCAN_ROOM_HEIGHT,
+      surfaces: [],
+      sweepMesh: null,
+    };
+
+    function createSweepMesh() {
+      const geometry = new THREE.RingGeometry(0.02, 3, 48);
+      geometry.rotateX(-Math.PI / 2); // horizontal, normal hacia arriba
+      const material = new THREE.MeshBasicMaterial({
+        color: CONFIG.SCAN_COLOR,
+        transparent: true,
+        opacity: 0.5,
+        blending: THREE.AdditiveBlending,
+        depthWrite: false,
+        side: THREE.DoubleSide,
+      });
+      return new THREE.Mesh(geometry, material);
+    }
+
+    function buildPlaneSurface(plane, pose) {
+      const points2D = plane.polygon.map((p) => new THREE.Vector2(p.x, p.z));
+      const shape = new THREE.Shape(points2D);
+      const geometry = new THREE.ShapeGeometry(shape);
+      geometry.rotateX(Math.PI / 2); // de XY local a XZ (normal +Y), como espera XRPlane
+
+      const fillMaterial = new THREE.MeshBasicMaterial({
+        color: CONFIG.SCAN_COLOR,
+        transparent: true,
+        opacity: 0,
+        blending: THREE.AdditiveBlending,
+        depthWrite: false,
+        side: THREE.DoubleSide,
+      });
+      const wireMaterial = new THREE.MeshBasicMaterial({
+        color: CONFIG.SCAN_COLOR,
+        wireframe: true,
+        transparent: true,
+        opacity: 0,
+        blending: THREE.AdditiveBlending,
+        depthWrite: false,
+      });
+
+      const group = new THREE.Group();
+      group.add(new THREE.Mesh(geometry, fillMaterial), new THREE.Mesh(geometry, wireMaterial));
+
+      const m = new THREE.Matrix4().fromArray(pose.transform.matrix);
+      m.decompose(group.position, group.quaternion, group.scale);
+      scene.add(group);
+
+      return {
+        object3d: group,
+        materials: [fillMaterial, wireMaterial],
+        baseOpacities: [CONFIG.SCAN_FILL_OPACITY, CONFIG.SCAN_WIRE_OPACITY],
+        revealY: group.position.y,
+        revealed: false,
+        revealElapsed: 0,
+      };
+    }
+
+    function buildMeshSurface(mesh, pose) {
+      const geometry = new THREE.BufferGeometry();
+      geometry.setAttribute("position", new THREE.BufferAttribute(mesh.vertices, 3));
+      geometry.setIndex(new THREE.BufferAttribute(mesh.indices, 1));
+
+      const material = new THREE.MeshBasicMaterial({
+        color: CONFIG.SCAN_COLOR,
+        wireframe: true,
+        transparent: true,
+        opacity: 0,
+        blending: THREE.AdditiveBlending,
+        depthWrite: false,
+      });
+      const wireMesh = new THREE.Mesh(geometry, material);
+
+      const m = new THREE.Matrix4().fromArray(pose.transform.matrix);
+      m.decompose(wireMesh.position, wireMesh.quaternion, wireMesh.scale);
+      scene.add(wireMesh);
+
+      return {
+        object3d: wireMesh,
+        materials: [material],
+        baseOpacities: [CONFIG.SCAN_WIRE_OPACITY],
+        revealY: wireMesh.position.y,
+        revealed: false,
+        revealElapsed: 0,
+      };
+    }
+
+    function disposeSurface(surface) {
+      scene.remove(surface.object3d);
+      surface.object3d.traverse((child) => {
+        if (child.geometry) child.geometry.dispose();
+      });
+      for (const material of surface.materials) material.dispose();
+    }
+
+    function startRoomScan(frame) {
+      const referenceSpace = renderer.xr.getReferenceSpace();
+
+      scanState.surfaces.forEach(disposeSurface);
+      scanState.surfaces.length = 0;
+
+      let minY = Infinity;
+      let maxY = -Infinity;
+
+      const planes = frame.detectedPlanes;
+      if (planes) {
+        for (const plane of planes) {
+          const pose = frame.getPose(plane.planeSpace, referenceSpace);
+          if (!pose) continue;
+          const surface = buildPlaneSurface(plane, pose);
+          scanState.surfaces.push(surface);
+          minY = Math.min(minY, surface.revealY);
+          maxY = Math.max(maxY, surface.revealY);
+        }
+      }
+
+      const meshes = frame.detectedMeshes;
+      if (meshes) {
+        for (const mesh of meshes) {
+          const pose = frame.getPose(mesh.meshSpace, referenceSpace);
+          if (!pose) continue;
+          const surface = buildMeshSurface(mesh, pose);
+          scanState.surfaces.push(surface);
+          minY = Math.min(minY, surface.revealY);
+          maxY = Math.max(maxY, surface.revealY);
+        }
+      }
+
+      if (!isFinite(minY)) {
+        // sin plane-detection / mesh-detection soportados o sin Space
+        // Setup hecho en la Quest: igual se ve el barrido, solo que no
+        // enciende ninguna superficie real.
+        minY = orb.position.y - 1;
+        maxY = orb.position.y + 1;
+      }
+
+      scanState.minY = minY;
+      scanState.maxY = Math.max(maxY, minY + 0.5);
+      scanState.elapsed = 0;
+      scanState.phase = "sweep";
+
+      if (!scanState.sweepMesh) scanState.sweepMesh = createSweepMesh();
+      scanState.sweepMesh.material.opacity = 0.5;
+      scanState.sweepMesh.position.set(_floatAnchor.x, minY, _floatAnchor.z);
+      scene.add(scanState.sweepMesh);
+    }
+
+    function updateScan(dt) {
+      scanState.elapsed += dt;
+
+      if (scanState.phase === "sweep") {
+        const t = Math.min(scanState.elapsed / CONFIG.SCAN_SWEEP_DURATION, 1);
+        const sweepY = THREE.MathUtils.lerp(scanState.minY, scanState.maxY, t);
+        scanState.sweepMesh.position.y = sweepY;
+
+        for (const surface of scanState.surfaces) {
+          if (!surface.revealed && sweepY >= surface.revealY) {
+            surface.revealed = true;
+          }
+          if (surface.revealed && surface.revealElapsed < CONFIG.SCAN_SURFACE_FADE_IN) {
+            surface.revealElapsed += dt;
+            const revealT = Math.min(surface.revealElapsed / CONFIG.SCAN_SURFACE_FADE_IN, 1);
+            for (let i = 0; i < surface.materials.length; i++) {
+              surface.materials[i].opacity = surface.baseOpacities[i] * revealT;
+            }
+          }
+        }
+
+        if (t >= 1) {
+          scanState.phase = "linger";
+          scanState.elapsed = 0;
+        }
+      } else if (scanState.phase === "linger") {
+        if (scanState.elapsed >= CONFIG.SCAN_LINGER) {
+          scanState.phase = "fadeout";
+          scanState.elapsed = 0;
+        }
+      } else if (scanState.phase === "fadeout") {
+        const t = Math.min(scanState.elapsed / CONFIG.SCAN_FADE_OUT, 1);
+        const fade = 1 - t;
+        scanState.sweepMesh.material.opacity = 0.5 * fade;
+        for (const surface of scanState.surfaces) {
+          for (let i = 0; i < surface.materials.length; i++) {
+            surface.materials[i].opacity = surface.baseOpacities[i] * fade;
+          }
+        }
+        if (t >= 1) endRoomScan();
+      }
+    }
+
+    function endRoomScan() {
+      scanState.surfaces.forEach(disposeSurface);
+      scanState.surfaces.length = 0;
+      scene.remove(scanState.sweepMesh);
+
+      orb.userData.innerGlow.scale.setScalar(1);
+      orb.userData.plasma.points.material.opacity = 0.9;
+      orb.position.copy(_floatAnchor);
+      orb.visible = true;
+      orbState = ORB_STATE.FLOATING;
+    }
+
+    // Estados FLOATING / HELD: pellizco para agarrar/soltar, puño para
+    // romper el orbe y arrancar el escaneo.
+    function updateCarry(dt, elapsedTime) {
       const lerpAlpha = 1 - Math.exp(-CONFIG.SMOOTHING_RATE * dt);
 
       samplePinch();
+      sampleFist();
       const pinchStarted = pinchActive && !wasPinching;
+      const fistStarted = fistActive && !wasFisting;
       wasPinching = pinchActive;
+      wasFisting = fistActive;
 
       if (orbState === ORB_STATE.FLOATING && pinchStarted) {
         if (_pinchMid.distanceTo(orb.position) < CONFIG.GRAB_RADIUS) {
           orbState = ORB_STATE.HELD; // lo agarraste
         }
-      } else if (orbState === ORB_STATE.HELD && pinchStarted) {
-        orbState = ORB_STATE.FLOATING; // te lo quitaste: queda flotando ahí mismo
-        _floatAnchor.copy(orb.position);
+      } else if (orbState === ORB_STATE.HELD) {
+        if (pinchStarted) {
+          orbState = ORB_STATE.FLOATING; // te lo quitaste: queda flotando ahí mismo
+          _floatAnchor.copy(orb.position);
+        } else if (fistStarted) {
+          startShatter();
+          return; // el resto lo maneja updateShatter desde el próximo frame
+        }
       }
 
       if (orbState === ORB_STATE.HELD) {
@@ -451,6 +792,25 @@
       }
 
       updatePlasma(orb.userData.plasma, elapsedTime);
+    }
+
+    function render(time, frame) {
+      const dt = clock.getDelta();
+      const elapsedTime = clock.getElapsedTime();
+
+      switch (orbState) {
+        case ORB_STATE.FLOATING:
+        case ORB_STATE.HELD:
+          updateCarry(dt, elapsedTime);
+          break;
+        case ORB_STATE.SHATTERING:
+          updateShatter(dt, frame);
+          break;
+        case ORB_STATE.SCANNING:
+          updateScan(dt);
+          break;
+      }
+
       renderer.render(scene, camera);
     }
     renderer.setAnimationLoop(render);
@@ -483,7 +843,7 @@
       statusEl.textContent = "";
       try {
         const session = await navigator.xr.requestSession("immersive-ar", {
-          optionalFeatures: ["hand-tracking", "local-floor"],
+          optionalFeatures: ["hand-tracking", "local-floor", "plane-detection", "mesh-detection"],
         });
 
         renderer.xr.addEventListener("sessionend", onSessionEnd, { once: true });
