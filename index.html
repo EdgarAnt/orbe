@@ -153,6 +153,11 @@
       // adentro, como una miniatura permanente
       MAQUETTE_SCALE: 0.06,             // tamaño final = tamaño real × esto
       MAQUETTE_COLLAPSE_DURATION: 1.2,  // segundos que tarda el zoom a miniatura
+
+      // Reescalar la maqueta con las dos manos pellizcando a la vez
+      MAQUETTE_RESIZE_RADIUS: 0.35, // distancia (m) máxima de algún pellizco al orbe para empezar
+      MAQUETTE_MIN_SCALE: 0.02,     // no se deja achicar más allá de esto
+      MAQUETTE_MAX_SCALE: 0.35,     // ni agrandar más allá de esto
     };
 
     // ------------------------------------------------------------------
@@ -391,20 +396,25 @@
 
     // ------------------------------------------------------------------
     // Manos — se agregan las dos (three.js necesita esto para actualizar
-    // los joints), pero solo usamos la que resulte ser la derecha, según
-    // el evento "connected" de WebXR (el índice 0/1 no garantiza mano).
+    // los joints). La derecha agarra/rompe el orbe; la izquierda solo se
+    // usa junto con la derecha para estirar la maqueta con las dos manos.
+    // El índice 0/1 no garantiza mano, así que se detecta por el evento
+    // "connected" de WebXR.
     // ------------------------------------------------------------------
     const handCandidates = [renderer.xr.getHand(0), renderer.xr.getHand(1)];
     let rightHand = null;
+    let leftHand = null;
 
     for (const hand of handCandidates) {
       scene.add(hand);
       hand.addEventListener("connected", (event) => {
         if (event.data.handedness === "right") rightHand = hand;
+        else if (event.data.handedness === "left") leftHand = hand;
         addHandOccluder(hand);
       });
       hand.addEventListener("disconnected", () => {
         if (rightHand === hand) rightHand = null;
+        if (leftHand === hand) leftHand = null;
       });
     }
 
@@ -416,6 +426,7 @@
     const ORB_STATE = {
       FLOATING: "floating",
       HELD: "held",
+      RESIZING: "resizing",     // las dos manos pellizcando, estirando la maqueta
       SHATTERING: "shattering", // se rompe en sus píxeles al cerrar el puño
       SCANNING: "scanning",     // barrido láser del cuarto en curso
     };
@@ -438,24 +449,29 @@
     );
     orb.position.copy(_floatAnchor);
 
-    // Pellizco de la mano derecha: distancia pulgar-índice. Deja el
-    // resultado en variables reutilizadas en vez de devolver un objeto.
-    let pinchActive = false;
-    function samplePinch() {
-      if (!rightHand) {
-        pinchActive = false;
-        return;
-      }
-      const thumb = rightHand.joints["thumb-tip"];
-      const index = rightHand.joints["index-finger-tip"];
-      if (!thumb || !index || !thumb.visible || !index.visible) {
-        pinchActive = false;
-        return;
-      }
+    // Pellizco (distancia pulgar-índice) de una mano cualquiera. Devuelve
+    // si está pellizcando y deja el punto medio en outMid (reutilizado
+    // por el caller en vez de crear un vector nuevo).
+    function sampleHandPinch(hand, outMid) {
+      if (!hand) return false;
+      const thumb = hand.joints["thumb-tip"];
+      const index = hand.joints["index-finger-tip"];
+      if (!thumb || !index || !thumb.visible || !index.visible) return false;
       thumb.getWorldPosition(_thumbPos);
       index.getWorldPosition(_indexPos);
-      _pinchMid.copy(_thumbPos).add(_indexPos).multiplyScalar(0.5);
-      pinchActive = _thumbPos.distanceTo(_indexPos) < CONFIG.PINCH_DISTANCE;
+      outMid.copy(_thumbPos).add(_indexPos).multiplyScalar(0.5);
+      return _thumbPos.distanceTo(_indexPos) < CONFIG.PINCH_DISTANCE;
+    }
+
+    let pinchActive = false;
+    function samplePinch() {
+      pinchActive = sampleHandPinch(rightHand, _pinchMid);
+    }
+
+    const _leftPinchMid = new THREE.Vector3();
+    let leftPinchActive = false;
+    function sampleLeftPinch() {
+      leftPinchActive = sampleHandPinch(leftHand, _leftPinchMid);
     }
 
     // Puño cerrado: promedio de distancia muñeca→punta de los 4 dedos
@@ -766,8 +782,13 @@
       clearMaqueta(); // por si ya había una maqueta de un escaneo anterior
 
       orb.userData.maquetaObjects = scanState.surfaces.map((s) => s.object3d);
+      orb.userData.maquetaScale = CONFIG.MAQUETTE_SCALE;
       for (const object3d of orb.userData.maquetaObjects) {
         orb.attach(object3d); // cambia de padre conservando su transform de mundo
+        // posición/escala "unitarias" (como si el factor de escala fuera 1),
+        // para poder recalcular a cualquier tamaño después sin ir acumulando error
+        object3d.userData.unitPosition = object3d.position.clone().divideScalar(CONFIG.MAQUETTE_SCALE);
+        object3d.userData.unitScale = object3d.scale.clone().divideScalar(CONFIG.MAQUETTE_SCALE);
       }
       scanState.surfaces.length = 0;
 
@@ -776,6 +797,16 @@
       orb.position.copy(_floatAnchor);
       orb.visible = true;
       orbState = ORB_STATE.FLOATING;
+    }
+
+    // Aplica un factor de escala absoluto a toda la maqueta, a partir de
+    // la posición/escala "unitarias" guardadas en finishMaquette().
+    function applyMaquetaScale(factor) {
+      orb.userData.maquetaScale = factor;
+      for (const object3d of orb.userData.maquetaObjects) {
+        object3d.position.copy(object3d.userData.unitPosition).multiplyScalar(factor);
+        object3d.scale.copy(object3d.userData.unitScale).multiplyScalar(factor);
+      }
     }
 
     function clearMaqueta() {
@@ -791,6 +822,31 @@
       orb.userData.maquetaObjects = null;
     }
 
+    // Reescalar la maqueta con las dos manos: se guarda al entrar cuánto
+    // medía la distancia entre pellizcos y el factor de escala de ese
+    // momento, y todo lo demás sale de la razón entre esa distancia y la
+    // distancia actual.
+    let resizeStartDistance = 1;
+    let resizeStartScale = CONFIG.MAQUETTE_SCALE;
+
+    function updateResize() {
+      samplePinch();
+      sampleLeftPinch();
+
+      if (!pinchActive || !leftPinchActive) {
+        orbState = ORB_STATE.FLOATING; // se soltó una de las dos manos
+        return;
+      }
+
+      const handsDistance = _pinchMid.distanceTo(_leftPinchMid);
+      const factor = THREE.MathUtils.clamp(
+        resizeStartScale * (handsDistance / resizeStartDistance),
+        CONFIG.MAQUETTE_MIN_SCALE,
+        CONFIG.MAQUETTE_MAX_SCALE
+      );
+      applyMaquetaScale(factor);
+    }
+
     // Estados FLOATING / HELD: pellizco para agarrar/soltar, puño para
     // romper el orbe y arrancar el escaneo.
     function updateCarry(dt, elapsedTime) {
@@ -798,8 +854,28 @@
 
       samplePinch();
       sampleFist();
+      sampleLeftPinch();
       const pinchStarted = pinchActive && !wasPinching;
       const fistStarted = fistActive && !wasFisting;
+
+      // Las dos manos pellizcando a la vez cerca del orbe (solo si ya
+      // tiene una maqueta adentro y está flotando, no mientras se lleva
+      // agarrado con una sola mano) arranca el reescalado.
+      if (
+        orbState === ORB_STATE.FLOATING &&
+        orb.userData.maquetaObjects &&
+        pinchActive && leftPinchActive &&
+        (_pinchMid.distanceTo(orb.position) < CONFIG.MAQUETTE_RESIZE_RADIUS ||
+          _leftPinchMid.distanceTo(orb.position) < CONFIG.MAQUETTE_RESIZE_RADIUS)
+      ) {
+        orbState = ORB_STATE.RESIZING;
+        resizeStartDistance = Math.max(_pinchMid.distanceTo(_leftPinchMid), 0.001);
+        resizeStartScale = orb.userData.maquetaScale;
+        wasPinching = pinchActive;
+        wasFisting = fistActive;
+        return; // el resto lo maneja updateResize desde el próximo frame
+      }
+
       wasPinching = pinchActive;
       wasFisting = fistActive;
 
@@ -842,6 +918,10 @@
         case ORB_STATE.FLOATING:
         case ORB_STATE.HELD:
           updateCarry(dt, elapsedTime);
+          break;
+        case ORB_STATE.RESIZING:
+          updateResize();
+          updatePlasma(orb.userData.plasma, elapsedTime);
           break;
         case ORB_STATE.SHATTERING:
           updateShatter(dt, frame);
